@@ -1,0 +1,23 @@
+[http-nio-8080-exec-209][INFO][2026-02-03T22:26:49.796+0700][tagId:899D2277277644A599DFD945853F932A][com.sde.modelsuite.proxy.BaseProxy] [SEND][camelbreadcrumbId:ID-sde-biz-cardx-mobius-gateway-ws-7bcc84886-4f8nz-1769428634725-0-16059885] 
+--------------------------------------
+Send URL = [http://sde-cardcore-ws-transaction.cdx-prod-crs-cardcore.svc.cluster.local:8080/statement/retrieveStatementListByAccountNumbersAndBilledPeriod], connectTimeout = [60], readTimeout = [60], requestMethod = [POST]
+Authorization : (value)
+Host : sde-cardcore-ws-transaction.cdx-prod-crs-cardcore.svc.cluster.local:8080
+Content-Type : application/json
+{
+  "obStatementDetail" : {
+    "billedStatus" : false,
+    "period" : "202601",
+    "obHeader" : { }
+  },
+  "accountNumbers" : [ "1940020101746661" ],
+  "obHeader" : {
+    "id" : "DDA99CF200BE4259A34F810ACD131D41",
+    "username" : "ENET0001",
+    "dateTimeIn" : "20260203222649",
+    "domainId" : "ENET",
+    "userId" : "ENET0001",
+    "defaultOrganizationUnit" : "90013"
+  }
+}
+--------------------------------------
