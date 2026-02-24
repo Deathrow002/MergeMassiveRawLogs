@@ -395,14 +395,12 @@ try {
         }
         
         Write-Host "Processing $TotalFiles files with $MaxThreads threads..."
-        Write-Host "Progress updates every 30 seconds..."
         Write-Host ""
         
-        # Collect results with periodic progress reporting
+        # Collect results with per-file progress reporting
         $CompletedCount = 0
         $TotalEntriesParsed = 0
-        $LastProgressTime = Get-Date
-        $ProgressInterval = 30  # seconds
+        $ProcessedBytes = 0L
         
         foreach ($Job in $Jobs) {
             try {
@@ -418,23 +416,19 @@ try {
                     }
                 }
                 
-                # Show progress every 30 seconds
-                $Now = Get-Date
-                $TimeSinceLastProgress = ($Now - $LastProgressTime).TotalSeconds
-                
-                if ($TimeSinceLastProgress -ge $ProgressInterval) {
-                    $Elapsed = ($Now - $StartTime).TotalSeconds
-                    $Percent = [math]::Round(($CompletedCount / $TotalFiles) * 100, 1)
-                    $Rate = if ($Elapsed -gt 0) { [math]::Round($CompletedCount / $Elapsed * 60, 1) } else { 0 }
-                    $ETASeconds = if ($CompletedCount -gt 0) { [math]::Round(($TotalFiles - $CompletedCount) * ($Elapsed / $CompletedCount)) } else { 0 }
-                    $ETAMinutes = [math]::Round($ETASeconds / 60, 1)
-                    
-                    Write-Host "  [PROGRESS] $CompletedCount/$TotalFiles files ($Percent%) | $TotalEntriesParsed entries | $([math]::Round($Elapsed/60, 1)) min elapsed | ETA: $ETAMinutes min | Rate: $Rate files/min"
-                    $LastProgressTime = $Now
+                # Get file size for progress calculation
+                $FileInfo = $Files | Where-Object { $_.Name -eq $Job.FileName } | Select-Object -First 1
+                if ($FileInfo) {
+                    $ProcessedBytes += $FileInfo.Length
                 }
+                
+                # Show progress for each file (like MergeLogs)
+                $ProgressPct = [math]::Round(($ProcessedBytes / $TotalSize) * 100, 1)
+                $EntryCount = if ($Result) { $Result.Count } else { 0 }
+                Write-Host "[$ProgressPct%] Parsed: $($Job.FileName) ($EntryCount entries)"
             }
             catch {
-                Write-Warning "Error processing $($Job.FileName): $_"
+                Write-Host "[ERROR] $($Job.FileName): $_"
             }
             finally {
                 $Job.PowerShell.Dispose()
@@ -443,8 +437,6 @@ try {
         
         # Final progress report
         $FinalElapsed = (Get-Date) - $StartTime
-        Write-Host ""
-        Write-Host "  [COMPLETE] $CompletedCount/$TotalFiles files | $TotalEntriesParsed entries | $([math]::Round($FinalElapsed.TotalMinutes, 2)) minutes"
         
         $RunspacePool.Close()
         $RunspacePool.Dispose()
