@@ -360,12 +360,12 @@ try {
     }
     elseif (Test-Path $InputPath -PathType Container) {
         # Directory mode with parallel processing
-        $Files = Get-ChildItem -Path $InputPath -Filter "*.txt" -File | Sort-Object Name
+        $Files = Get-ChildItem -Path $InputPath -Filter "*.log" -File | Sort-Object Name
         $TotalFiles = $Files.Count
         $TotalSize = ($Files | Measure-Object -Property Length -Sum).Sum
         
         if ($TotalFiles -eq 0) {
-            Write-Host "No .txt files found in input directory."
+            Write-Host "No .log files found in input directory."
             $Writer.Close()
             exit 0
         }
