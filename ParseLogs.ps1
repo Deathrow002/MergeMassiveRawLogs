@@ -395,22 +395,42 @@ try {
         }
         
         Write-Host "Processing $TotalFiles files with $MaxThreads threads..."
+        Write-Host "Progress updates every 30 seconds..."
+        Write-Host ""
         
-        # Collect results as they complete and write to disk
+        # Collect results with periodic progress reporting
         $CompletedCount = 0
+        $TotalEntriesParsed = 0
+        $LastProgressTime = Get-Date
+        $ProgressInterval = 30  # seconds
+        
         foreach ($Job in $Jobs) {
             try {
                 $Result = $Job.PowerShell.EndInvoke($Job.Handle)
                 $CompletedCount++
                 
                 if ($Result -and $Result.Entries) {
-                    $Percent = [math]::Round(($CompletedCount / $TotalFiles) * 100, 1)
-                    Write-Host "  [$CompletedCount/$TotalFiles] ($Percent%) $($Result.FileName) - $($Result.Count) entries"
+                    $TotalEntriesParsed += $Result.Count
                     
                     # Add entries to collection
                     foreach ($Entry in $Result.Entries) {
                         Add-EntryToCollection -Entry $Entry
                     }
+                }
+                
+                # Show progress every 30 seconds
+                $Now = Get-Date
+                $TimeSinceLastProgress = ($Now - $LastProgressTime).TotalSeconds
+                
+                if ($TimeSinceLastProgress -ge $ProgressInterval) {
+                    $Elapsed = ($Now - $StartTime).TotalSeconds
+                    $Percent = [math]::Round(($CompletedCount / $TotalFiles) * 100, 1)
+                    $Rate = if ($Elapsed -gt 0) { [math]::Round($CompletedCount / $Elapsed * 60, 1) } else { 0 }
+                    $ETASeconds = if ($CompletedCount -gt 0) { [math]::Round(($TotalFiles - $CompletedCount) * ($Elapsed / $CompletedCount)) } else { 0 }
+                    $ETAMinutes = [math]::Round($ETASeconds / 60, 1)
+                    
+                    Write-Host "  [PROGRESS] $CompletedCount/$TotalFiles files ($Percent%) | $TotalEntriesParsed entries | $([math]::Round($Elapsed/60, 1)) min elapsed | ETA: $ETAMinutes min | Rate: $Rate files/min"
+                    $LastProgressTime = $Now
                 }
             }
             catch {
@@ -421,11 +441,16 @@ try {
             }
         }
         
+        # Final progress report
+        $FinalElapsed = (Get-Date) - $StartTime
+        Write-Host ""
+        Write-Host "  [COMPLETE] $CompletedCount/$TotalFiles files | $TotalEntriesParsed entries | $([math]::Round($FinalElapsed.TotalMinutes, 2)) minutes"
+        
         $RunspacePool.Close()
         $RunspacePool.Dispose()
         
-        $ElapsedTime = (Get-Date) - $StartTime
-        Write-Host "Parallel processing completed in $($ElapsedTime.TotalSeconds.ToString('F2')) seconds"
+        Write-Host ""
+        Write-Host "Parallel processing completed in $($FinalElapsed.TotalSeconds.ToString('F2')) seconds"
     }
     else {
         Write-Error "Input path does not exist: $InputPath"
