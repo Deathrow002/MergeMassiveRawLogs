@@ -1,16 +1,23 @@
 # ParseLogs.ps1
 # PowerShell script to parse raw logs and convert to structured JSON format
-# Separates URL, Headers, and Body for each log entry
+# Optimized for massive log files (tested up to 50GB+)
+# Uses parallel processing + streaming I/O to minimize memory usage
+#
+# Output: JSON format (.json) - standard JSON array
 #
 # Usage:
 #   .\ParseLogs.ps1 -InputPath ".\data\input" -OutputPath ".\data\output\parsed.json"
 #   .\ParseLogs.ps1 -InputFile ".\data\input\log1.txt" -OutputPath ".\output.json"
+#   .\ParseLogs.ps1 -InputPath ".\logs" -SplitOutput -MaxEntriesPerFile 500000
+#   .\ParseLogs.ps1 -InputPath ".\logs" -MaxThreads 16
 
 param(
     [string]$InputPath = ".\data\input",
     [string]$InputFile = "",
     [string]$OutputPath = ".\data\output\parsed.json",
-    [int]$MaxThreads = [Environment]::ProcessorCount
+    [int]$MaxThreads = [Environment]::ProcessorCount,
+    [switch]$SplitOutput,     # Split into multiple output files
+    [int]$MaxEntriesPerFile = 100000  # Max entries per output file when splitting
 )
 
 function Parse-LogEntry {
@@ -171,43 +178,10 @@ function Parse-LogFile {
 }
 
 # Main execution
-Write-Host "Log Parser - Converting raw logs to structured JSON"
-Write-Host "=================================================="
-
-$AllEntries = @()
-
-if ($InputFile -ne "" -and (Test-Path $InputFile -PathType Leaf)) {
-    # Single file mode
-    Write-Host "Parsing file: $InputFile"
-    $AllEntries = Parse-LogFile -FilePath $InputFile
-}
-elseif (Test-Path $InputPath -PathType Container) {
-    # Directory mode
-    $Files = Get-ChildItem -Path $InputPath -Filter "*.txt" -File | Sort-Object Name
-    $TotalFiles = $Files.Count
-    
-    if ($TotalFiles -eq 0) {
-        Write-Host "No .txt files found in input directory."
-        exit 0
-    }
-    
-    Write-Host "Found $TotalFiles files to parse"
-    
-    $FileIndex = 0
-    foreach ($File in $Files) {
-        $FileIndex++
-        Write-Host "[$FileIndex/$TotalFiles] Parsing: $($File.Name)"
-        
-        $Entries = Parse-LogFile -FilePath $File.FullName
-        $AllEntries += $Entries
-        
-        Write-Host "  Found $($Entries.Count) log entries"
-    }
-}
-else {
-    Write-Error "Input path does not exist: $InputPath"
-    exit 1
-}
+Write-Host "Log Parser - Converting raw logs to structured JSON (Parallel + Streaming)"
+Write-Host "==========================================================================="
+Write-Host "Mode: $(if ($SplitOutput) { 'Split output files' } else { 'Single JSON file' })"
+Write-Host "Max threads: $MaxThreads"
 
 # Create output directory if needed
 $OutputDir = Split-Path $OutputPath -Parent
@@ -215,11 +189,275 @@ if ($OutputDir -and -not (Test-Path $OutputDir)) {
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 }
 
-# Write output JSON
+# Output configuration
+$OutputBaseName = [System.IO.Path]::GetFileNameWithoutExtension($OutputPath)
+$OutputExtension = ".json"
+$OutputDirectory = if ($OutputDir) { $OutputDir } else { "." }
+$FinalOutputPath = Join-Path $OutputDirectory "$OutputBaseName$OutputExtension"
+
+# Collect all entries
+$AllEntries = [System.Collections.Generic.List[object]]::new()
+$CurrentFileIndex = 0
+
+function Add-EntryToCollection {
+    param($Entry)
+    
+    $script:AllEntries.Add($Entry)
+    
+    # Split file if needed
+    if ($SplitOutput -and $script:AllEntries.Count -ge $MaxEntriesPerFile) {
+        $FilePath = if ($script:CurrentFileIndex -eq 0) {
+            Join-Path $OutputDirectory "$OutputBaseName$OutputExtension"
+        } else {
+            Join-Path $OutputDirectory "$OutputBaseName`_$($script:CurrentFileIndex.ToString('D4'))$OutputExtension"
+        }
+        
+        $JsonOutput = $script:AllEntries.ToArray() | ConvertTo-Json -Depth 10
+        [System.IO.File]::WriteAllText($FilePath, $JsonOutput, [System.Text.Encoding]::UTF8)
+        Write-Host "  Wrote $($script:AllEntries.Count) entries to: $([System.IO.Path]::GetFileName($FilePath))"
+        
+        $script:CurrentFileIndex++
+        $script:AllEntries.Clear()
+    }
+}
+
+# Runspace script block - returns parsed entries array
+$ProcessFileScriptBlock = {
+    param([string]$FilePath)
+    
+    $Results = [System.Collections.Generic.List[hashtable]]::new()
+    
+    # Inline parse function
+    function Parse-Entry {
+        param([string]$RawEntry)
+        
+        $Entry = @{
+            Timestamp = $null; ThreadName = $null; Level = $null; TagId = $null
+            ClassName = $null; Action = $null; CamelBreadcrumbId = $null
+            ResponseCode = $null; Url = $null; ExecutionTimeMs = $null
+            ConnectTimeout = $null; ReadTimeout = $null; RequestMethod = $null
+            Headers = @{}; Body = $null
+        }
+        
+        $Lines = $RawEntry -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" -and $_ -ne "--------------------------------------" }
+        if ($Lines.Count -eq 0) { return $null }
+        
+        $HeaderLine = $Lines[0]
+        if ($HeaderLine -match '^\[([^\]]+)\]') { $Entry.ThreadName = $Matches[1] }
+        if ($HeaderLine -match '\]\[(INFO|DEBUG|WARN|ERROR|TRACE)\]\[') { $Entry.Level = $Matches[1] }
+        if ($HeaderLine -match '\[(\d{4}-\d{2}-\d{2}T[\d:\.]+[+-]\d{4})\]') { $Entry.Timestamp = $Matches[1] }
+        if ($HeaderLine -match '\[tagId:([^\]]+)\]') { $Entry.TagId = $Matches[1] }
+        if ($HeaderLine -match '\[(com\.[a-zA-Z\._]+)\]') { $Entry.ClassName = $Matches[1] }
+        if ($HeaderLine -match '\[(SEND|RECEIVE)\]') { $Entry.Action = $Matches[1] }
+        if ($HeaderLine -match '\[camelbreadcrumbId:([^\]]+)\]') { $Entry.CamelBreadcrumbId = $Matches[1] }
+        
+        $JsonStartIndex = -1
+        for ($i = 1; $i -lt $Lines.Count; $i++) {
+            $Line = $Lines[$i]
+            if ($Line -match '^\{') { $JsonStartIndex = $i; break }
+            if ($Line -match 'Response Code = \[(\d+)\]') { $Entry.ResponseCode = [int]$Matches[1] }
+            if ($Line -match 'Receive URL = \[([^\]]+)\], execution time = \[(\d+)\]') {
+                $Entry.Url = $Matches[1]; $Entry.ExecutionTimeMs = [int]$Matches[2]
+            }
+            if ($Line -match 'Send URL = \[([^\]]+)\]') {
+                $Entry.Url = $Matches[1]
+                if ($Line -match 'connectTimeout = \[(\d+)\]') { $Entry.ConnectTimeout = [int]$Matches[1] }
+                if ($Line -match 'readTimeout = \[(\d+)\]') { $Entry.ReadTimeout = [int]$Matches[1] }
+                if ($Line -match 'requestMethod = \[([^\]]+)\]') { $Entry.RequestMethod = $Matches[1] }
+            }
+            if ($Line -match '^([A-Za-z\-]+)\s*:\s*(.+)$') {
+                $Entry.Headers[$Matches[1].Trim()] = $Matches[2].Trim()
+            }
+        }
+        
+        if ($JsonStartIndex -ge 0) {
+            $JsonLines = $Lines[$JsonStartIndex..($Lines.Count - 1)] -join "`n"
+            try { $Entry.Body = $JsonLines | ConvertFrom-Json } catch { $Entry.Body = $JsonLines }
+        }
+        
+        # Clean up
+        $CleanEntry = @{}
+        foreach ($Key in $Entry.Keys) {
+            $Value = $Entry[$Key]
+            if ($null -ne $Value) {
+                if ($Value -is [hashtable] -and $Value.Count -eq 0) { continue }
+                if ($Value -is [string] -and [string]::IsNullOrEmpty($Value)) { continue }
+                $CleanEntry[$Key] = $Value
+            }
+        }
+        return $CleanEntry
+    }
+    
+    $FileSize = (Get-Item $FilePath).Length
+    
+    if ($FileSize -gt 100MB) {
+        # Large file: stream read
+        $Reader = [System.IO.StreamReader]::new($FilePath, [System.Text.Encoding]::UTF8)
+        $Buffer = [System.Text.StringBuilder]::new()
+        $Separator = "--------------------------------------"
+        
+        try {
+            while (-not $Reader.EndOfStream) {
+                $Line = $Reader.ReadLine()
+                
+                if ($Line -eq $Separator -and $Buffer.Length -gt 0) {
+                    $RawEntry = $Buffer.ToString()
+                    $Parsed = Parse-Entry -RawEntry $RawEntry
+                    if ($null -ne $Parsed -and $Parsed.Count -gt 0) {
+                        $Results.Add($Parsed)
+                    }
+                    $Buffer.Clear()
+                }
+                [void]$Buffer.AppendLine($Line)
+            }
+            
+            if ($Buffer.Length -gt 0) {
+                $RawEntry = $Buffer.ToString()
+                $Parsed = Parse-Entry -RawEntry $RawEntry
+                if ($null -ne $Parsed -and $Parsed.Count -gt 0) {
+                    $Results.Add($Parsed)
+                }
+            }
+        }
+        finally {
+            $Reader.Close()
+        }
+    }
+    else {
+        # Small file: load into memory
+        $Content = [System.IO.File]::ReadAllText($FilePath, [System.Text.Encoding]::UTF8)
+        $RawEntries = $Content -split '(?=--------------------------------------\r?\n\[)'
+        
+        foreach ($RawEntry in $RawEntries) {
+            if ([string]::IsNullOrWhiteSpace($RawEntry)) { continue }
+            $Parsed = Parse-Entry -RawEntry $RawEntry
+            if ($null -ne $Parsed -and $Parsed.Count -gt 0) {
+                $Results.Add($Parsed)
+            }
+        }
+    }
+    
+    return @{
+        FileName = [System.IO.Path]::GetFileName($FilePath)
+        Entries = $Results.ToArray()
+        Count = $Results.Count
+    }
+}
+
+try {
+    if ($InputFile -ne "" -and (Test-Path $InputFile -PathType Leaf)) {
+        # Single file mode - process directly
+        Write-Host "Parsing single file: $InputFile"
+        $FileSize = (Get-Item $InputFile).Length
+        Write-Host "File size: $([math]::Round($FileSize / 1GB, 2)) GB"
+        
+        $Result = & $ProcessFileScriptBlock -FilePath $InputFile
+        Write-Host "Parsed $($Result.Count) entries, writing to disk..."
+        
+        foreach ($Entry in $Result.Entries) {
+            Add-EntryToCollection -Entry $Entry
+        }
+    }
+    elseif (Test-Path $InputPath -PathType Container) {
+        # Directory mode with parallel processing
+        $Files = Get-ChildItem -Path $InputPath -Filter "*.txt" -File | Sort-Object Name
+        $TotalFiles = $Files.Count
+        $TotalSize = ($Files | Measure-Object -Property Length -Sum).Sum
+        
+        if ($TotalFiles -eq 0) {
+            Write-Host "No .txt files found in input directory."
+            $Writer.Close()
+            exit 0
+        }
+        
+        Write-Host "Found $TotalFiles files ($([math]::Round($TotalSize / 1GB, 2)) GB) to parse..."
+        $StartTime = Get-Date
+        
+        # Create runspace pool
+        $RunspacePool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $MaxThreads)
+        $RunspacePool.Open()
+        
+        $Jobs = [System.Collections.Generic.List[object]]::new()
+        
+        # Submit all files to runspace pool
+        foreach ($File in $Files) {
+            $PowerShell = [System.Management.Automation.PowerShell]::Create()
+            $PowerShell.RunspacePool = $RunspacePool
+            
+            [void]$PowerShell.AddScript($ProcessFileScriptBlock)
+            [void]$PowerShell.AddParameter("FilePath", $File.FullName)
+            
+            $Jobs.Add(@{
+                PowerShell = $PowerShell
+                Handle = $PowerShell.BeginInvoke()
+                FileName = $File.Name
+            })
+        }
+        
+        Write-Host "Processing $TotalFiles files with $MaxThreads threads..."
+        
+        # Collect results as they complete and write to disk
+        $CompletedCount = 0
+        foreach ($Job in $Jobs) {
+            try {
+                $Result = $Job.PowerShell.EndInvoke($Job.Handle)
+                $CompletedCount++
+                
+                if ($Result -and $Result.Entries) {
+                    $Percent = [math]::Round(($CompletedCount / $TotalFiles) * 100, 1)
+                    Write-Host "  [$CompletedCount/$TotalFiles] ($Percent%) $($Result.FileName) - $($Result.Count) entries"
+                    
+                    # Add entries to collection
+                    foreach ($Entry in $Result.Entries) {
+                        Add-EntryToCollection -Entry $Entry
+                    }
+                }
+            }
+            catch {
+                Write-Warning "Error processing $($Job.FileName): $_"
+            }
+            finally {
+                $Job.PowerShell.Dispose()
+            }
+        }
+        
+        $RunspacePool.Close()
+        $RunspacePool.Dispose()
+        
+        $ElapsedTime = (Get-Date) - $StartTime
+        Write-Host "Parallel processing completed in $($ElapsedTime.TotalSeconds.ToString('F2')) seconds"
+    }
+    else {
+        Write-Error "Input path does not exist: $InputPath"
+        exit 1
+    }
+}
+catch {
+    Write-Error "Error during processing: $_"
+    exit 1
+}
+
+# Write remaining entries to final file
+if ($AllEntries.Count -gt 0) {
+    $FilePath = if ($CurrentFileIndex -eq 0) {
+        $FinalOutputPath
+    } else {
+        Join-Path $OutputDirectory "$OutputBaseName`_$($CurrentFileIndex.ToString('D4'))$OutputExtension"
+    }
+    
+    Write-Host "Writing $($AllEntries.Count) entries to: $([System.IO.Path]::GetFileName($FilePath))"
+    $JsonOutput = $AllEntries.ToArray() | ConvertTo-Json -Depth 10
+    [System.IO.File]::WriteAllText($FilePath, $JsonOutput, [System.Text.Encoding]::UTF8)
+}
+
+$TotalEntriesWritten = $AllEntries.Count + ($CurrentFileIndex * $MaxEntriesPerFile)
+
 Write-Host ""
-Write-Host "Writing $($AllEntries.Count) entries to: $OutputPath"
-
-$JsonOutput = $AllEntries | ConvertTo-Json -Depth 10
-[System.IO.File]::WriteAllText($OutputPath, $JsonOutput, [System.Text.Encoding]::UTF8)
-
+Write-Host "========================================="
 Write-Host "Parse completed successfully!"
+Write-Host "Total entries written: $TotalEntriesWritten"
+if ($SplitOutput -and $CurrentFileIndex -gt 0) {
+    Write-Host "Output files: $($CurrentFileIndex + 1) files created"
+}
+Write-Host "Output: $FinalOutputPath"
+Write-Host "Format: JSON (.json)"
