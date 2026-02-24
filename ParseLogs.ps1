@@ -17,7 +17,8 @@ param(
     [string]$OutputPath = ".\data\output\parsed.json",
     [int]$MaxThreads = [Environment]::ProcessorCount,
     [switch]$SplitOutput,     # Split into multiple output files
-    [int]$MaxEntriesPerFile = 100000  # Max entries per output file when splitting
+    [int]$MaxEntriesPerFile = 100000,  # Max entries per output file when splitting
+    [switch]$OneToOne         # Create one JSON file per input log file (matches filename)
 )
 
 function Parse-LogEntry {
@@ -180,11 +181,26 @@ function Parse-LogFile {
 # Main execution
 Write-Host "Log Parser - Converting raw logs to structured JSON (Parallel + Streaming)"
 Write-Host "==========================================================================="
-Write-Host "Mode: $(if ($SplitOutput) { 'Split output files' } else { 'Single JSON file' })"
+if ($OneToOne) {
+    Write-Host "Mode: One-to-One (1 log file -> 1 JSON file)"
+} else {
+    Write-Host "Mode: $(if ($SplitOutput) { 'Split output files' } else { 'Single JSON file' })"
+}
 Write-Host "Max threads: $MaxThreads"
 
 # Create output directory if needed
-$OutputDir = Split-Path $OutputPath -Parent
+if ($OneToOne) {
+    # In OneToOne mode, OutputPath is treated as the output DIRECTORY
+    # If it has an extension, we strip it and use the parent folder
+    if ([System.IO.Path]::HasExtension($OutputPath)) {
+        $OutputDir = Split-Path $OutputPath -Parent
+    } else {
+        $OutputDir = $OutputPath
+    }
+} else {
+    $OutputDir = Split-Path $OutputPath -Parent
+}
+
 if ($OutputDir -and -not (Test-Path $OutputDir)) {
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 }
@@ -193,6 +209,7 @@ if ($OutputDir -and -not (Test-Path $OutputDir)) {
 $OutputBaseName = [System.IO.Path]::GetFileNameWithoutExtension($OutputPath)
 $OutputExtension = ".json"
 $OutputDirectory = if ($OutputDir) { $OutputDir } else { "." }
+# FinalOutputPath used only for Single/Split mode
 $FinalOutputPath = Join-Path $OutputDirectory "$OutputBaseName$OutputExtension"
 
 # Collect all entries
@@ -345,22 +362,94 @@ $ProcessFileScriptBlock = {
 }
 
 try {
+    # Main logic
+    if ($OneToOne) {
+        if ($InputFile) {
+            # Single file input in OneToOne mode
+            Write-Host "Single file: $InputFile"
+            $Base = [System.IO.Path]::GetFileNameWithoutExtension($InputFile)
+            $Output = Join-Path $OutputDirectory "$Base.json"
+            $FinalOutputPath = $Output
+            # Use streaming mode as fallback since it handles memory well
+        } 
+        # For directory, logic falls through to directory block below
+    }
+
     if ($InputFile -ne "" -and (Test-Path $InputFile -PathType Leaf)) {
-        # Single file mode - process directly
+        # Single file mode - STREAMING PROCESS to avoid OOM
+        # If OneToOne is set, we just set the output path correctly above basically.
+        
         Write-Host "Parsing single file: $InputFile"
         $FileSize = (Get-Item $InputFile).Length
+
         Write-Host "File size: $([math]::Round($FileSize / 1GB, 2)) GB"
+        Write-Host "Using STREAMING MODE to avoid memory issues."
         
-        $Result = & $ProcessFileScriptBlock -FilePath $InputFile
-        Write-Host "Parsed $($Result.Count) entries, writing to disk..."
+        # Prepare output
+        $Writer = [System.IO.StreamWriter]::new($FinalOutputPath, $false, [System.Text.Encoding]::UTF8)
+        $Writer.Write("[")
+        $FirstEntry = $true
+        $EntryCount = 0
         
-        foreach ($Entry in $Result.Entries) {
-            Add-EntryToCollection -Entry $Entry
+        # Setup Reader
+        $Reader = [System.IO.StreamReader]::new($InputFile, [System.Text.Encoding]::UTF8)
+        $Buffer = [System.Text.StringBuilder]::new()
+        $Separator = "--------------------------------------"
+        
+        # Re-using the Parse-LogEntry function logic inline or from global scope if available.
+        # But Parse-LogEntry is defined globally at line 18, so we can use it!
+
+        try {
+            while ($null -ne ($Line = $Reader.ReadLine())) {
+                if ($Line -eq $Separator -and $Buffer.Length -gt 0) {
+                    $RawEntry = $Buffer.ToString()
+                    $Parsed = Parse-LogEntry -RawEntry $RawEntry
+                    
+                    if ($null -ne $Parsed -and $Parsed.Count -gt 0) {
+                        if (-not $FirstEntry) { $Writer.Write(",") }
+                        
+                        $JsonFragment = $Parsed | ConvertTo-Json -Depth 10 -Compress
+                        $Writer.Write($JsonFragment)
+                        $FirstEntry = $false
+                        $EntryCount++
+                        
+                        if ($EntryCount % 1000 -eq 0) {
+                            Write-Host "Processed $EntryCount entries..." -ForegroundColor Cyan
+                        }
+                    }
+                    $Buffer.Clear()
+                }
+                [void]$Buffer.AppendLine($Line)
+            }
+            
+            # Flush remaining buffer
+            if ($Buffer.Length -gt 0) {
+                 $RawEntry = $Buffer.ToString()
+                 $Parsed = Parse-LogEntry -RawEntry $RawEntry
+                 if ($null -ne $Parsed -and $Parsed.Count -gt 0) {
+                    if (-not $FirstEntry) { $Writer.Write(",") }
+                    $JsonFragment = $Parsed | ConvertTo-Json -Depth 10 -Compress
+                    $Writer.Write($JsonFragment)
+                    $EntryCount++
+                 }
+            }
+            
+            $Writer.Write("]")
+            $Writer.Close()
+            $Reader.Close()
+            
+            Write-Host "`nParsed $EntryCount entries."
+            Write-Host "Output written to: $FinalOutputPath"
+        }
+        catch {
+            Write-Error "Error during streaming: $_"
+            if ($null -ne $Writer) { $Writer.Close() }
+            if ($null -ne $Reader) { $Reader.Close() }
         }
     }
     elseif (Test-Path $InputPath -PathType Container) {
         # Directory mode with parallel processing
-        $Files = Get-ChildItem -Path $InputPath -Filter "*.log" -File | Sort-Object Name
+        $Files = Get-ChildItem -Path $InputPath -Include "*.log","*.txt" -File -Recurse | Sort-Object Name
         $TotalFiles = $Files.Count
         $TotalSize = ($Files | Measure-Object -Property Length -Sum).Sum
         
@@ -403,7 +492,12 @@ try {
         $ProcessedBytes = 0L
         $PendingJobs = [System.Collections.Generic.List[object]]::new($Jobs)
         
+        if ($OneToOne) {
+            $TotalEntriesWritten = 0
+        }
+        
         while ($PendingJobs.Count -gt 0) {
+
             $CompletedJob = $null
             
             # Find any completed job
@@ -427,15 +521,28 @@ try {
                 $Result = $CompletedJob.PowerShell.EndInvoke($CompletedJob.Handle)
                 $CompletedCount++
                 
-                if ($Result -and $Result.Entries) {
-                    $TotalEntriesParsed += $Result.Count
-                    
-                    # Add entries to collection
-                    foreach ($Entry in $Result.Entries) {
-                        Add-EntryToCollection -Entry $Entry
-                    }
-                }
-                
+if ($OneToOne) {
+            # In One-To-One mode, we write inside processing logic
+            $FileBase = [System.IO.Path]::GetFileNameWithoutExtension($CompletedJob.FileName)
+            $NewFileName = "$FileBase.json"
+            $NewFilePath = Join-Path $OutputDirectory $NewFileName
+            
+            # Since Parse-Entry returns entries in memory, write them here
+            if ($Result.Entries -and $Result.Entries.Count -gt 0) {
+               $JsonOutput = $Result.Entries | ConvertTo-Json -Depth 10
+               [System.IO.File]::WriteAllText($NewFilePath, $JsonOutput, [System.Text.Encoding]::UTF8)
+               $TotalEntriesWritten += $Result.Entries.Count
+               Write-Host "  Written to: $NewFileName"
+            }
+        }
+        else {
+             if ($Result -and $Result.Entries) {
+                 $TotalEntriesParsed += $Result.Entries.Count
+                 foreach ($Entry in $Result.Entries) {
+                     Add-EntryToCollection -Entry $Entry
+                 }
+             }
+        }
                 # Get file size for progress calculation
                 $FileInfo = $Files | Where-Object { $_.Name -eq $CompletedJob.FileName } | Select-Object -First 1
                 if ($FileInfo) {
@@ -475,19 +582,28 @@ catch {
 }
 
 # Write remaining entries to final file
-if ($AllEntries.Count -gt 0) {
-    $FilePath = if ($CurrentFileIndex -eq 0) {
-        $FinalOutputPath
-    } else {
-        Join-Path $OutputDirectory "$OutputBaseName`_$($CurrentFileIndex.ToString('D4'))$OutputExtension"
+if (-not $OneToOne) {
+    if ($AllEntries.Count -gt 0) {
+        $FilePath = if ($CurrentFileIndex -eq 0) {
+            $FinalOutputPath
+        } else {
+            Join-Path $OutputDirectory "$OutputBaseName`_$($CurrentFileIndex.ToString('D4'))$OutputExtension"
+        }
+        
+        Write-Host "Writing $($AllEntries.Count) entries to: $([System.IO.Path]::GetFileName($FilePath))"
+        $JsonOutput = $AllEntries.ToArray() | ConvertTo-Json -Depth 10
+        [System.IO.File]::WriteAllText($FilePath, $JsonOutput, [System.Text.Encoding]::UTF8)
     }
-    
-    Write-Host "Writing $($AllEntries.Count) entries to: $([System.IO.Path]::GetFileName($FilePath))"
-    $JsonOutput = $AllEntries.ToArray() | ConvertTo-Json -Depth 10
-    [System.IO.File]::WriteAllText($FilePath, $JsonOutput, [System.Text.Encoding]::UTF8)
 }
 
-$TotalEntriesWritten = $AllEntries.Count + ($CurrentFileIndex * $MaxEntriesPerFile)
+if ($OneToOne) {
+    # No-op, already written
+} else {
+    $TotalEntriesWritten = $AllEntries.Count + ($CurrentFileIndex * $MaxEntriesPerFile)
+}
+
+
+
 
 Write-Host ""
 Write-Host "========================================="
@@ -496,5 +612,10 @@ Write-Host "Total entries written: $TotalEntriesWritten"
 if ($SplitOutput -and $CurrentFileIndex -gt 0) {
     Write-Host "Output files: $($CurrentFileIndex + 1) files created"
 }
-Write-Host "Output: $FinalOutputPath"
-Write-Host "Format: JSON (.json)"
+if ($OneToOne) {
+    Write-Host "Output Directory: $OutputDirectory"
+    Write-Host "Format: JSON (.json) per file"
+} else {
+    Write-Host "Output: $FinalOutputPath"
+    Write-Host "Format: JSON (.json)"
+}
