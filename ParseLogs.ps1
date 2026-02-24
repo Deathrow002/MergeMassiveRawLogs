@@ -397,14 +397,34 @@ try {
         Write-Host "Processing $TotalFiles files with $MaxThreads threads..."
         Write-Host ""
         
-        # Collect results with per-file progress reporting
+        # Collect results as they complete (not in submission order)
         $CompletedCount = 0
         $TotalEntriesParsed = 0
         $ProcessedBytes = 0L
+        $PendingJobs = [System.Collections.Generic.List[object]]::new($Jobs)
         
-        foreach ($Job in $Jobs) {
+        while ($PendingJobs.Count -gt 0) {
+            $CompletedJob = $null
+            
+            # Find any completed job
+            foreach ($Job in $PendingJobs) {
+                if ($Job.Handle.IsCompleted) {
+                    $CompletedJob = $Job
+                    break
+                }
+            }
+            
+            if ($null -eq $CompletedJob) {
+                # No job completed yet, wait briefly
+                Start-Sleep -Milliseconds 100
+                continue
+            }
+            
+            # Remove from pending list
+            [void]$PendingJobs.Remove($CompletedJob)
+            
             try {
-                $Result = $Job.PowerShell.EndInvoke($Job.Handle)
+                $Result = $CompletedJob.PowerShell.EndInvoke($CompletedJob.Handle)
                 $CompletedCount++
                 
                 if ($Result -and $Result.Entries) {
@@ -417,7 +437,7 @@ try {
                 }
                 
                 # Get file size for progress calculation
-                $FileInfo = $Files | Where-Object { $_.Name -eq $Job.FileName } | Select-Object -First 1
+                $FileInfo = $Files | Where-Object { $_.Name -eq $CompletedJob.FileName } | Select-Object -First 1
                 if ($FileInfo) {
                     $ProcessedBytes += $FileInfo.Length
                 }
@@ -425,13 +445,13 @@ try {
                 # Show progress for each file (like MergeLogs)
                 $ProgressPct = [math]::Round(($ProcessedBytes / $TotalSize) * 100, 1)
                 $EntryCount = if ($Result) { $Result.Count } else { 0 }
-                Write-Host "[$ProgressPct%] Parsed: $($Job.FileName) ($EntryCount entries)"
+                Write-Host "[$ProgressPct%] Parsed: $($CompletedJob.FileName) ($EntryCount entries)"
             }
             catch {
-                Write-Host "[ERROR] $($Job.FileName): $_"
+                Write-Host "[ERROR] $($CompletedJob.FileName): $_"
             }
             finally {
-                $Job.PowerShell.Dispose()
+                $CompletedJob.PowerShell.Dispose()
             }
         }
         
