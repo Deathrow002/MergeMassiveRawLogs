@@ -494,6 +494,7 @@ try {
         
         if ($OneToOne) {
             $TotalEntriesWritten = 0
+            Write-Host "Starting parallel processing..."
         }
         
         while ($PendingJobs.Count -gt 0) {
@@ -510,7 +511,11 @@ try {
             
             if ($null -eq $CompletedJob) {
                 # No job completed yet, wait briefly
-                Start-Sleep -Milliseconds 100
+                if ($OneToOne) {
+                    Write-Host "." -NoNewline
+                    if ($i++ % 60 -eq 0) { Write-Host "" }
+                }
+                Start-Sleep -Milliseconds 1000
                 continue
             }
             
