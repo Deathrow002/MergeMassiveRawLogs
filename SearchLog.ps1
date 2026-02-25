@@ -1,3 +1,24 @@
+<#
+.SYNOPSIS
+    Search for a keyword in multiple log files concurrently.
+
+.DESCRIPTION
+    This script searches for a specific keyword in one or more files or directories.
+    It uses parallel processing (Runspaces) to search multiple files efficiently.
+    Results include the file path, line number, and content.
+
+.EXAMPLE
+    .\SearchLog.ps1 -Path ".\data\input" -Keyword "Error"
+    Search all files in the ".\data\input" directory for "Error".
+
+.EXAMPLE
+    .\SearchLog.ps1 -Path ".\data\input\log1.txt", ".\data\input\log2.txt" -Keyword "Exception" -OutputPath "results.txt"
+    Search specific files for "Exception" and save results to "results.txt".
+
+.EXAMPLE
+    .\SearchLog.ps1 -Path ".\data" -Keyword "Timeout" -MaxThreads 8
+    Search recursively in ".\data" using 8 concurrent threads.
+#>
 param(
     [Parameter(Mandatory=$true)]
     [string[]]$Path,
