@@ -1,11 +1,12 @@
 # FindTimeRange.ps1
-# PowerShell script to find the earliest and latest timestamp across all log files
-# Scans recursively under data/input/{folder}/{file.log} (and flat files)
-# Extracts timestamps in format [yyyy-MM-ddTHH:mm:ss.SSS+ZZZZ] from log header lines
-# Uses parallel processing (Runspaces) for efficiency with large numbers of files
+# PowerShell script to find the earliest and latest timestamp across all log files.
+# Scans recursively under a given directory (and subfolders).
+# Extracts timestamps in format [yyyy-MM-ddTHH:mm:ss.SSS+ZZZZ] from log header lines.
+# Uses parallel processing (Runspaces) for efficiency with large numbers of files.
 #
-# Usage:
-#   # Default path (.\data\input)
+# ── Run as Script ──────────────────────────────────────────────────────
+#
+#   # Default path (.\data\input), auto-detect CPU thread count
 #   .\FindTimeRange.ps1
 #
 #   # Custom input path
@@ -15,18 +16,33 @@
 #   # Customize thread count
 #   .\FindTimeRange.ps1 -InputPath ".\data\input" -MaxThreads 8
 #
-#   # Use as function in other scripts:
-#   #   . .\FindTimeRange.ps1   # dot-source to load function
-#   #   $result = Find-TimeRange -InputPath ".\data\input"
-#   #   $result.Earliest       # global earliest DateTimeOffset
-#   #   $result.Latest         # global latest DateTimeOffset
-#   #   $result.FileResults    # per-file details array
+# ── Use as Reusable Function ──────────────────────────────────────────
 #
-# Parameters:
+#   # 1. Dot-source the script to load the Find-TimeRange function
+#   . .\FindTimeRange.ps1
+#
+#   # 2. Call the function — returns a single PSCustomObject
+#   $result = Find-TimeRange -InputPath ".\data\input"
+#   $result = Find-TimeRange -InputPath "C:\server\logs" -MaxThreads 16
+#
+#   # 3. Access properties on the result
+#   $result.TotalFiles     # int    — number of files scanned
+#   $result.TotalSizeMB    # double — total size in MB
+#   $result.Earliest       # DateTimeOffset — global earliest timestamp
+#   $result.EarliestFile   # string — relative path of the file containing the earliest
+#   $result.Latest         # DateTimeOffset — global latest timestamp
+#   $result.LatestFile     # string — relative path of the file containing the latest
+#   $result.Duration       # TimeSpan — difference between latest and earliest
+#   $result.DurationText   # string — human-readable duration (e.g. "1d 2h 30m 5.123s")
+#   $result.FileResults    # array  — per-file objects with: File, SizeMB, Earliest, Latest
+#
+# ── Parameters ─────────────────────────────────────────────────────────
+#
 #   -InputPath   : Root directory to scan recursively (default: .\data\input)
 #   -MaxThreads  : Number of parallel threads (default: CPU core count)
 #
-# Output:
+# ── Output (when run as script) ───────────────────────────────────────
+#
 #   - Lists all discovered files grouped by folder with sizes
 #   - Shows per-file earliest/latest timestamps
 #   - Shows global earliest/latest with source file and total duration
